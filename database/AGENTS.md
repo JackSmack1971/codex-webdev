@@ -46,12 +46,13 @@ Based on the 2025 technology landscape, choose databases that align with your sp
 
 ### Schema Design Principles
 ```sql
--- Use UUIDs for distributed systems
+-- Use UUIDs - prefer gen_random_uuid() for PostgreSQL 13+
+-- But uuid_generate_v4() still works if uuid-ossp extension is preferred
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- User table with proper constraints and indexes
+-- User table with modern constraints and indexes
 CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), -- Modern approach
     email VARCHAR(255) UNIQUE NOT NULL,
     email_verified BOOLEAN DEFAULT FALSE,
     password_hash VARCHAR(255) NOT NULL,
@@ -65,58 +66,59 @@ CREATE TABLE users (
     deleted_at TIMESTAMP WITH TIME ZONE
 );
 
--- Indexes for performance
+-- Modern indexes for performance
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_users_role ON users(role);
 CREATE INDEX idx_users_created_at ON users(created_at);
-CREATE INDEX idx_users_deleted_at ON users(deleted_at) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX idx_users_deleted_at ON users(id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_users_metadata ON users USING GIN(metadata);
 
--- Full-text search index
+-- Full-text search index with modern syntax
 CREATE INDEX idx_users_search ON users USING GIN(
     to_tsvector('english', first_name || ' ' || last_name || ' ' || email)
 );
 ```
 
-### Advanced PostgreSQL Features
+### Advanced PostgreSQL 17 Features
 ```sql
--- JSONB for flexible schema
+-- Enhanced JSONB operations with newer functions
 CREATE TABLE user_preferences (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     preferences JSONB NOT NULL DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- JSONB indexes for performance
+-- Modern JSONB indexes and operations
 CREATE INDEX idx_preferences_user_id ON user_preferences(user_id);
 CREATE INDEX idx_preferences_data ON user_preferences USING GIN(preferences);
 
--- Partial indexes for specific queries
-CREATE INDEX idx_preferences_theme ON user_preferences((preferences->>'theme')) 
-WHERE preferences ? 'theme';
+-- Advanced JSONB path queries (PostgreSQL 17)
+CREATE INDEX idx_preferences_theme ON user_preferences 
+USING BTREE((preferences->>'theme')) WHERE preferences ? 'theme';
 
--- Function-based index for computed values
-CREATE INDEX idx_users_full_name ON users(LOWER(first_name || ' ' || last_name));
+-- JSON path expression indexes
+CREATE INDEX idx_preferences_notifications ON user_preferences 
+USING GIN((preferences @? '$.notifications.**'));
 
--- Composite indexes for common query patterns
-CREATE INDEX idx_users_role_created ON users(role, created_at) WHERE deleted_at IS NULL;
-
--- Conditional unique constraints
-CREATE UNIQUE INDEX idx_users_email_active ON users(email) WHERE deleted_at IS NULL;
+-- Composite indexes with include columns (PostgreSQL 11+)
+CREATE INDEX idx_users_role_created_include ON users(role, created_at) 
+INCLUDE (first_name, last_name) WHERE deleted_at IS NULL;
 ```
 
 ### Database Triggers and Functions
 ```sql
--- Automatic updated_at trigger
+-- Modern trigger function with better error handling
 CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $
+RETURNS TRIGGER 
+LANGUAGE plpgsql
+AS $$
 BEGIN
     NEW.updated_at = NOW();
     RETURN NEW;
 END;
-$ language 'plpgsql';
+$$;
 
 -- Apply trigger to tables
 CREATE TRIGGER update_users_updated_at 
@@ -124,9 +126,11 @@ CREATE TRIGGER update_users_updated_at
     FOR EACH ROW 
     EXECUTE FUNCTION update_updated_at_column();
 
--- Audit log function
+-- Advanced audit log function with JSONB
 CREATE OR REPLACE FUNCTION create_audit_log()
-RETURNS TRIGGER AS $
+RETURNS TRIGGER 
+LANGUAGE plpgsql
+AS $$
 BEGIN
     INSERT INTO audit_logs (
         table_name,
@@ -138,20 +142,20 @@ BEGIN
     ) VALUES (
         TG_TABLE_NAME,
         TG_OP,
-        CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE NULL END,
-        CASE WHEN TG_OP IN ('INSERT', 'UPDATE') THEN row_to_json(NEW) ELSE NULL END,
+        CASE WHEN TG_OP IN ('UPDATE', 'DELETE') THEN to_jsonb(OLD) ELSE NULL END,
+        CASE WHEN TG_OP IN ('INSERT', 'UPDATE') THEN to_jsonb(NEW) ELSE NULL END,
         COALESCE(NEW.updated_by, OLD.updated_by),
         NOW()
     );
     RETURN COALESCE(NEW, OLD);
 END;
-$ language 'plpgsql';
+$$;
 ```
 
 ### Query Optimization Patterns
 ```sql
--- Use EXPLAIN ANALYZE for query optimization
-EXPLAIN (ANALYZE, BUFFERS, VERBOSE) 
+-- Modern query optimization with EXPLAIN
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) 
 SELECT u.*, p.preferences 
 FROM users u 
 LEFT JOIN user_preferences p ON u.id = p.user_id 
@@ -161,32 +165,33 @@ WHERE u.role = 'user'
 ORDER BY u.created_at DESC 
 LIMIT 20;
 
--- Efficient pagination with cursor-based approach
+-- Efficient pagination with improved cursor approach
 SELECT * FROM users 
-WHERE created_at < $1  -- cursor timestamp
+WHERE (created_at, id) < ($1, $2)  -- composite cursor
     AND deleted_at IS NULL
-ORDER BY created_at DESC 
+ORDER BY created_at DESC, id DESC
 LIMIT 20;
 
--- Efficient search with full-text search
-SELECT *, ts_rank(search_vector, plainto_tsquery('english', $1)) as rank
+-- Modern full-text search with ranking
+SELECT *, 
+       ts_rank(search_vector, websearch_to_tsquery('english', $1)) as rank
 FROM users 
-WHERE search_vector @@ plainto_tsquery('english', $1)
+WHERE search_vector @@ websearch_to_tsquery('english', $1)
     AND deleted_at IS NULL
 ORDER BY rank DESC, created_at DESC
 LIMIT 20;
 
--- Use CTEs for complex queries
-WITH recent_users AS (
+-- Enhanced CTEs with materialization control
+WITH recent_users AS MATERIALIZED (
     SELECT id, email, created_at
     FROM users 
     WHERE created_at > NOW() - INTERVAL '7 days'
         AND deleted_at IS NULL
 ),
-user_stats AS (
+user_stats AS NOT MATERIALIZED (
     SELECT 
         COUNT(*) as total_users,
-        COUNT(CASE WHEN email_verified THEN 1 END) as verified_users
+        COUNT(*) FILTER (WHERE email_verified) as verified_users
     FROM recent_users
 )
 SELECT * FROM user_stats;
@@ -196,7 +201,7 @@ SELECT * FROM user_stats;
 
 ### Collection Design Patterns
 ```javascript
-// User document schema with embedded and referenced data
+// Enhanced user document schema with time series support
 {
   "_id": ObjectId("..."),
   "email": "user@example.com",
@@ -226,39 +231,41 @@ SELECT * FROM user_stats;
   "deletedAt": null
 }
 
-// Indexes for performance
+// Modern indexes for performance
 db.users.createIndex({ "email": 1 }, { unique: true, sparse: true })
 db.users.createIndex({ "roles": 1 })
 db.users.createIndex({ "createdAt": 1 })
 db.users.createIndex({ "deletedAt": 1 }, { sparse: true })
+
+// Enhanced text index with weights
 db.users.createIndex({ 
   "profile.firstName": "text", 
   "profile.lastName": "text", 
   "email": "text" 
+}, {
+  weights: {
+    "profile.firstName": 10,
+    "profile.lastName": 10,
+    "email": 5
+  }
 })
 
-// Compound indexes for common queries
+// Modern compound indexes for complex queries
 db.users.createIndex({ 
   "roles": 1, 
   "createdAt": -1, 
   "deletedAt": 1 
 })
 
-// Partial indexes for specific conditions
-db.users.createIndex(
-  { "email": 1 },
-  { 
-    partialFilterExpression: { "emailVerified": true },
-    name: "idx_verified_emails"
-  }
-)
+// Wildcard indexes for flexible queries (MongoDB 4.2+)
+db.users.createIndex({ "profile.$**": 1 })
 ```
 
 ### Aggregation Pipeline Patterns
 ```javascript
-// Complex aggregation for user analytics
+// Modern aggregation with new operators (MongoDB 7.0+)
 db.users.aggregate([
-  // Match active users from last 30 days
+  // Match with enhanced date operators
   {
     $match: {
       createdAt: { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
@@ -266,36 +273,44 @@ db.users.aggregate([
     }
   },
   
-  // Add computed fields
+  // Enhanced computed fields with new operators
   {
     $addFields: {
       fullName: { $concat: ["$profile.firstName", " ", "$profile.lastName"] },
       daysSinceCreated: {
-        $divide: [
-          { $subtract: [new Date(), "$createdAt"] },
-          1000 * 60 * 60 * 24
-        ]
+        $dateDiff: {
+          startDate: "$createdAt",
+          endDate: "$$NOW",
+          unit: "day"
+        }
+      },
+      isRecentUser: {
+        $dateDiff: {
+          startDate: "$createdAt",
+          endDate: "$$NOW",
+          unit: "day"
+        }
       }
     }
   },
   
-  // Group by role and calculate metrics
+  // Modern grouping with enhanced accumulators
   {
     $group: {
       _id: "$roles",
-      count: { $sum: 1 },
+      count: { $count: {} },
       avgDaysSinceCreated: { $avg: "$daysSinceCreated" },
-      verifiedCount: {
-        $sum: { $cond: ["$emailVerified", 1, 0] }
-      }
+      verifiedCount: { $sum: { $cond: ["$emailVerified", 1, 0] } },
+      // New accumulator in MongoDB 7.0
+      firstNUsers: { $firstN: { input: "$$ROOT", n: 5 } }
     }
   },
   
-  // Sort by count descending
+  // Enhanced sorting
   { $sort: { count: -1 } }
 ])
 
-// Lookup pattern for joining collections
+// Modern lookup with improved performance
 db.orders.aggregate([
   {
     $lookup: {
@@ -304,6 +319,7 @@ db.orders.aggregate([
       foreignField: "_id",
       as: "user",
       pipeline: [
+        { $match: { deletedAt: { $exists: false } } },
         { $project: { email: 1, "profile.firstName": 1, "profile.lastName": 1 } }
       ]
     }
@@ -320,9 +336,9 @@ db.orders.aggregate([
 ])
 ```
 
-### Schema Validation
+### Schema Validation (MongoDB 7.0)
 ```javascript
-// JSON Schema validation for collections
+// Modern JSON Schema validation with enhanced features
 db.createCollection("users", {
   validator: {
     $jsonSchema: {
@@ -341,7 +357,7 @@ db.createCollection("users", {
         passwordHash: {
           bsonType: "string",
           minLength: 60,
-          description: "Hashed password"
+          description: "Hashed password (bcrypt)"
         },
         profile: {
           bsonType: "object",
@@ -358,10 +374,20 @@ db.createCollection("users", {
               maxLength: 100
             },
             avatar: {
-              bsonType: "string"
+              bsonType: "string",
+              pattern: "^https?://.+"
             },
             preferences: {
-              bsonType: "object"
+              bsonType: "object",
+              properties: {
+                theme: {
+                  enum: ["light", "dark", "auto"]
+                },
+                language: {
+                  bsonType: "string",
+                  pattern: "^[a-z]{2}(-[A-Z]{2})?$"
+                }
+              }
             }
           }
         },
@@ -370,7 +396,9 @@ db.createCollection("users", {
           items: {
             bsonType: "string",
             enum: ["admin", "user", "moderator"]
-          }
+          },
+          minItems: 1,
+          uniqueItems: true
         },
         createdAt: {
           bsonType: "date"
@@ -393,44 +421,33 @@ db.createCollection("users", {
 
 ### Caching Patterns
 ```javascript
-// User session caching
+import { createClient } from 'redis';
+
+// Modern client initialization with proper error handling
+const client = await createClient({
+  url: 'redis://localhost:6379'
+})
+  .on('error', (err) => console.error('Redis Client Error', err))
+  .connect();
+
+// Enhanced session caching with proper expiration
 const sessionKey = `session:${userId}:${sessionId}`;
-await redis.setex(sessionKey, 3600, JSON.stringify(sessionData)); // 1 hour TTL
-
-// API response caching with cache invalidation
-const cacheKey = `api:users:${page}:${limit}:${filters}`;
-const cached = await redis.get(cacheKey);
-
-if (cached) {
-  return JSON.parse(cached);
-}
-
-const result = await fetchUsersFromDatabase(page, limit, filters);
-await redis.setex(cacheKey, 300, JSON.stringify(result)); // 5 minutes TTL
-
-// Cache invalidation on data change
-await redis.del(`api:users:*`); // Simple approach
-// Or use Redis patterns for more sophisticated invalidation
-await redis.eval(`
-  for i, key in ipairs(redis.call('keys', ARGV[1])) do
-    redis.call('del', key)
-  end
-`, 0, 'api:users:*');
+await client.setEx(sessionKey, 3600, JSON.stringify(sessionData)); // Modern approach
 ```
 
 ### Rate Limiting
 ```javascript
-// Sliding window rate limiting
+// Modern sliding window rate limiting with improved error handling
 async function checkRateLimit(userId, action, limit, windowSizeSeconds) {
   const key = `rate_limit:${userId}:${action}`;
   const now = Date.now();
   const windowStart = now - (windowSizeSeconds * 1000);
   
-  // Remove expired entries and count current requests
-  const pipeline = redis.pipeline();
-  pipeline.zremrangebyscore(key, 0, windowStart);
-  pipeline.zcard(key);
-  pipeline.zadd(key, now, now);
+  // Use modern pipeline approach
+  const pipeline = client.multi();
+  pipeline.zRemRangeByScore(key, 0, windowStart);
+  pipeline.zCard(key);
+  pipeline.zAdd(key, { score: now, value: now });
   pipeline.expire(key, windowSizeSeconds);
   
   const results = await pipeline.exec();
@@ -443,124 +460,213 @@ async function checkRateLimit(userId, action, limit, windowSizeSeconds) {
   };
 }
 
-// Usage
+// Usage with modern async/await
 const { allowed, remaining } = await checkRateLimit(
   userId, 
   'api_call', 
   100, // 100 requests
   3600 // per hour
 );
+
+if (!allowed) {
+  throw new Error(`Rate limit exceeded. Try again in ${resetTime - Date.now()}ms`);
+}
 ```
 
 ### Pub/Sub for Real-time Features
 ```javascript
-// Real-time notification system
+// Modern pub/sub with proper connection handling
 class NotificationService {
-  constructor(redisClient) {
-    this.redis = redisClient;
-    this.subscriber = redisClient.duplicate();
+  constructor() {
+    this.publisher = null;
+    this.subscriber = null;
+  }
+
+  async initialize() {
+    // Create separate connections for pub/sub
+    this.publisher = await createClient()
+      .on('error', (err) => console.error('Redis Publisher Error', err))
+      .connect();
+
+    this.subscriber = await createClient()
+      .on('error', (err) => console.error('Redis Subscriber Error', err))
+      .connect();
   }
 
   async publishNotification(userId, notification) {
     const channel = `notifications:${userId}`;
-    await this.redis.publish(channel, JSON.stringify({
-      id: generateId(),
+    const message = JSON.stringify({
+      id: crypto.randomUUID(), // Modern UUID generation
       type: notification.type,
       title: notification.title,
       message: notification.message,
       data: notification.data,
       timestamp: Date.now()
-    }));
+    });
+    
+    await this.publisher.publish(channel, message);
   }
 
   async subscribeToUserNotifications(userId, callback) {
     const channel = `notifications:${userId}`;
-    await this.subscriber.subscribe(channel);
     
-    this.subscriber.on('message', (receivedChannel, message) => {
-      if (receivedChannel === channel) {
+    // Modern subscription pattern
+    await this.subscriber.subscribe(channel, (message) => {
+      try {
         const notification = JSON.parse(message);
         callback(notification);
+      } catch (error) {
+        console.error('Failed to parse notification:', error);
       }
     });
   }
 
   async publishToChannel(channel, message) {
-    await this.redis.publish(channel, JSON.stringify(message));
+    await this.publisher.publish(channel, JSON.stringify(message));
+  }
+
+  async close() {
+    await Promise.all([
+      this.publisher?.disconnect(),
+      this.subscriber?.disconnect()
+    ]);
+  }
+}
+```
+
+
+## Modern Pipeline Operations
+```javascript
+// Enhanced pipeline operations with proper error handling
+async function batchOperations(operations) {
+  const pipeline = client.multi();
+  
+  operations.forEach(op => {
+    switch (op.type) {
+      case 'set':
+        pipeline.set(op.key, op.value);
+        break;
+      case 'get':
+        pipeline.get(op.key);
+        break;
+      case 'sadd':
+        pipeline.sAdd(op.key, op.members);
+        break;
+      default:
+        throw new Error(`Unknown operation type: ${op.type}`);
+    }
+  });
+  
+  try {
+    const results = await pipeline.exec();
+    return results.map((result, index) => ({
+      operation: operations[index],
+      result: result[1], // result[0] is error, result[1] is value
+      error: result[0]
+    }));
+  } catch (error) {
+    console.error('Pipeline execution failed:', error);
+    throw error;
   }
 }
 
-// Real-time metrics updates
-await redis.publish('metrics:update', JSON.stringify({
-  type: 'user_count',
-  value: await getUserCount(),
-  timestamp: Date.now()
-}));
+// Usage
+const operations = [
+  { type: 'set', key: 'user:1', value: 'John' },
+  { type: 'get', key: 'user:1' },
+  { type: 'sadd', key: 'users:active', members: ['user:1'] }
+];
+
+const results = await batchOperations(operations);
 ```
 
 ## Vector Database Implementation (2025)
 
 ### Pinecone Configuration
 ```python
-# Python example for Pinecone vector database
-import pinecone
-from sentence_transformers import SentenceTransformer
-
-# Initialize Pinecone
-pinecone.init(
-    api_key="your-api-key",
-    environment="your-env"
+# Updated Pinecone implementation with modern client
+from pinecone import (
+    Pinecone,
+    ServerlessSpec,
+    CloudProvider,
+    AwsRegion,
+    Metric,
+    VectorType
 )
 
-# Create index for semantic search
-index_name = "document-search"
-if index_name not in pinecone.list_indexes():
-    pinecone.create_index(
-        name=index_name,
-        dimension=384,  # Sentence transformer dimension
-        metric="cosine"
+# Modern client initialization
+pc = Pinecone(api_key="your-api-key")
+
+# Create modern serverless index
+index_config = pc.create_index(
+    name="document-search",
+    dimension=1536,  # OpenAI ada-002 dimension
+    metric=Metric.COSINE,
+    vector_type=VectorType.DENSE,
+    spec=ServerlessSpec(
+        cloud=CloudProvider.AWS,
+        region=AwsRegion.US_EAST_1
+    )
+)
+
+# Connect to index
+index = pc.Index(host=index_config.host)
+
+# Store document embeddings with modern approach
+def store_document(doc_id, text, metadata=None):
+    # Use OpenAI or other embedding service
+    import openai
+    
+    response = openai.embeddings.create(
+        model="text-embedding-ada-002",
+        input=text
+    )
+    embedding = response.data[0].embedding
+    
+    index.upsert(
+        vectors=[{
+            "id": doc_id,
+            "values": embedding,
+            "metadata": metadata or {}
+        }],
+        namespace="documents"
     )
 
-index = pinecone.Index(index_name)
-
-# Initialize embedding model
-model = SentenceTransformer('all-MiniLM-L6-v2')
-
-# Store document embeddings
-def store_document(doc_id, text, metadata=None):
-    embedding = model.encode(text).tolist()
-    index.upsert(vectors=[{
-        "id": doc_id,
-        "values": embedding,
-        "metadata": metadata or {}
-    }])
-
-# Semantic search
+# Modern semantic search with filtering
 def search_documents(query, top_k=10, filter_metadata=None):
-    query_embedding = model.encode(query).tolist()
+    # Generate query embedding
+    response = openai.embeddings.create(
+        model="text-embedding-ada-002",
+        input=query
+    )
+    query_embedding = response.data[0].embedding
     
+    # Search with modern filtering
     results = index.query(
         vector=query_embedding,
         top_k=top_k,
         include_metadata=True,
-        filter=filter_metadata
+        include_values=False,  # Don't return vectors for efficiency
+        filter=filter_metadata,
+        namespace="documents"
     )
     
-    return results['matches']
+    return results.matches
 
-# Usage examples
+# Usage examples with enhanced metadata
 store_document(
     doc_id="doc_1",
-    text="Machine learning algorithms for natural language processing",
-    metadata={"category": "AI", "author": "John Doe"}
+    text="Machine learning algorithms for natural language processing in 2025",
+    metadata={
+        "category": "AI", 
+        "author": "John Doe",
+        "year": 2025,
+        "tags": ["ml", "nlp", "2025"]
+    }
 )
 
-# Search with metadata filtering
-results = search_documents(
-    query="artificial intelligence techniques",
-    top_k=5,
-    filter_metadata={"category": "AI"}
-)
+# Enhanced search with complex filtering
+results = search_documents
 ```
 
 ### Weaviate Configuration
